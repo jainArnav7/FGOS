@@ -7,7 +7,11 @@
 # ============================================================
 
 import discord
+from fastapi import FastAPI
+import uvicorn
+import threading
 from discord.ext import commands, tasks
+from discord import app_commands
 from openai import OpenAI
 import os
 import sqlite3
@@ -20,8 +24,62 @@ import random
 import struct
 import tempfile
 import edge_tts
-from collections import Counter
+from collections import Counter, defaultdict
 from dotenv import load_dotenv
+from battleship import create_game, get_game, get_game_by_id, end_game
+from core.ai import ask_ai
+
+app = FastAPI()
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+def run_api():
+    uvicorn.run(app, host="0.0.0.0", port=8000)
+
+threading.Thread(target=run_api, daemon=True).start()
+
+async def safe_defer(ctx, ephemeral: bool = False):
+    try:
+        await ctx.defer(ephemeral=ephemeral)
+    except Exception as e:
+        text = str(e)
+        if isinstance(e, discord.NotFound) or 'Unknown interaction' in text or 'Unknown interaction' in getattr(e, 'text', ''):
+            return
+        # Some hybrid/autonomous contexts may not support defer.
+        if 'interaction' in text.lower() and 'none' in text.lower():
+            return
+        raise
+
+async def safe_send(destination, content: str = None, **kwargs):
+    try:
+        if content is None:
+            return await destination.send(**kwargs)
+
+        if isinstance(content, str) and len(content) > 1990:
+            buffer = io.BytesIO(content.encode('utf-8'))
+            filename = kwargs.pop('filename', 'board.txt')
+            return await destination.send(file=discord.File(buffer, filename=filename), **kwargs)
+
+        return await destination.send(content, **kwargs)
+    except Exception as e:
+        # Fallback: some Context/Interaction objects may no longer have a valid interaction
+        try:
+            # If destination has a channel attribute, send there
+            channel = getattr(destination, 'channel', None) or getattr(destination, 'guild', None)
+            if channel and hasattr(channel, 'send'):
+                if isinstance(content, str) and len(content) > 1990:
+                    buffer = io.BytesIO(content.encode('utf-8'))
+                    filename = kwargs.pop('filename', 'board.txt')
+                    return await channel.send(file=discord.File(buffer, filename=filename), **kwargs)
+                return await channel.send(content, **kwargs)
+        except Exception:
+            pass
+        raise
+
+# Recently handled message IDs to avoid duplicate replies from on_message
+recently_handled_messages = set()
 
 # ── voice-recv import (install: pip install discord-ext-voice-recv) ──
 # NOTE: Voice receive requires Opus codec which is complex to set up on Windows.
@@ -556,30 +614,17 @@ Call them "{display}"."""
 # AI CALLS
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 def call_ai(system: str, history: list, user_msg: str, max_tokens: int = 800) -> str:
-    messages = [{"role": "system", "content": system}]
-    messages.extend(history)
-    messages.append({"role": "user", "content": user_msg})
-    last_error = None
+    class _UserProxy:
+        def __init__(self, prompt: str):
+            self.id = None
+            self.name = "Discord"
+            self.prompt = prompt
 
-    for model in GROQ_MODELS:
-        try:
-            print(f"→ {model}")
-            completion = ai_client.chat.completions.create(
-                model=model, messages=messages,
-                max_tokens=max_tokens, temperature=0.68,
-            )
-            content = completion.choices[0].message.content
-            if content and content.strip():
-                clean = re.sub(r'<think>.*?</think>', '', content, flags=re.DOTALL).strip()
-                clean = re.sub(r'</?think>', '', clean).strip()
-                print(f"✓ {model}")
-                return clean if clean else content.strip()
-            last_error = f"{model} returned empty"
-        except Exception as e:
-            print(f"✗ {model}: {e}")
-            last_error = str(e)
-
-    raise RuntimeError(f"All models failed. Last: {last_error}")
+    try:
+        return ask_ai(_UserProxy(user_msg), system_prompt=system, history=history, max_tokens=max_tokens)
+    except Exception as e:
+        print(f"AI routing error: {e}")
+        raise
 
 def quick_ai(prompt: str, max_tokens: int = 500) -> str:
     system = "You are FG-OS. Be concise, accurate, and natural. Answer directly without corporate hedging."
@@ -996,11 +1041,11 @@ async def on_ready():
         check_reminders.start()
     if not conversation_starter.is_running():
         conversation_starter.start()
-    print("━" * 50)
+    print("=" * 50)
     print(f"FG-OS LIVE: {bot.user.name}")
     print(f"Backend: Groq | TTS: edge-tts | Whisper: {WHISPER_MODEL}")
-    print(f"Voice recv: {'✓ enabled' if VOICE_RECV_AVAILABLE else '✗ disabled (pip install discord-ext-voice-recv)'}")
-    print("━" * 50)
+    print(f"Voice recv: {'ENABLED' if VOICE_RECV_AVAILABLE else 'DISABLED (pip install discord-ext-voice-recv)'}")
+    print("=" * 50)
 
 @bot.event
 async def on_voice_state_update(member, before, after):
@@ -1301,6 +1346,303 @@ async def starterchannel(ctx):
         starter_channels.add(cid)
         await ctx.send("convo starters ON — dropping one every ~45 min")
 
+# ── BATTLESHIP COMMANDS ─────────────────────────────
+@bot.hybrid_command(name="battleship", description="Challenge the AI or another player to Battleship")
+async def battleship(ctx, opponent: discord.Member = None):
+    """Start a battleship game"""
+    await safe_defer(ctx)
+    
+    if opponent and opponent.bot and opponent.id != bot.user.id:
+        await safe_send(ctx, "can't play against bots (only the AI)")
+        return
+    
+    is_ai = opponent is None
+    
+    if is_ai:
+        game_id = create_game(ctx.author.id, ctx.author.display_name, is_ai=True, channel=ctx.channel)
+        game = get_game_by_id(game_id)
+        
+        embed = discord.Embed(
+            title="🚢 BATTLESHIP 🚢",
+            description="",
+            color=0x0099FF
+        )
+        embed.add_field(
+            name="👤 Players",
+            value=f"🟦 **{ctx.author.display_name}** vs 🤖 **FG-OS AI** (Very Smart)",
+            inline=False
+        )
+        embed.add_field(
+            name="✅ Status",
+            value="Both fleets deployed randomly\n**Game Started!**",
+            inline=False
+        )
+        embed.add_field(
+            name="📋 Commands",
+            value="`/fire A 5` — Attack coordinate\n`/gameboard` — View your boards\n`/quitgame` — Surrender",
+            inline=False
+        )
+        embed.set_footer(text=f"🎮 Game #{game_id} | {ctx.author.display_name}'s Turn")
+        
+        msg = await ctx.send(embed=embed)
+        
+        # Show the board
+        board_str = game.get_board_string(for_player1=True)
+        await safe_send(ctx, f"```\n{board_str}\n```")
+    else:
+        if opponent.id == ctx.author.id:
+            await ctx.send("you can't play against yourself, goofball")
+            return
+        
+        game_id = create_game(ctx.author.id, ctx.author.display_name, opponent.id, opponent.display_name, channel=ctx.channel)
+        game = get_game_by_id(game_id)
+        
+        embed = discord.Embed(
+            title="🚢 BATTLESHIP 🚢",
+            description="",
+            color=0x0099FF
+        )
+        embed.add_field(
+            name="👥 Players",
+            value=f"🟦 **{ctx.author.display_name}** vs 🟥 **{opponent.display_name}**",
+            inline=False
+        )
+        embed.add_field(
+            name="✅ Status",
+            value="Both fleets deployed randomly\n**Game Started!**",
+            inline=False
+        )
+        embed.add_field(
+            name="📋 Commands",
+            value="`/fire A 5` — Attack coordinate\n`/gameboard` — View your boards\n`/quitgame` — Surrender",
+            inline=False
+        )
+        embed.set_footer(text=f"🎮 Game #{game_id} | {ctx.author.display_name}'s Turn")
+        
+        msg = await ctx.send(embed=embed)
+        
+        # Send boards to each player
+        board_str = game.get_board_string(for_player1=True)
+        try:
+            await safe_send(ctx.author, f"```\n{board_str}\n```")
+        except:
+            pass
+        
+        board_str = game.get_board_string(for_player1=False)
+        try:
+            await safe_send(opponent, f"```\n{board_str}\n```")
+        except:
+            pass
+
+@bot.hybrid_command(name="fire", description="Take a shot! Example: /fire A 5")
+async def fire(ctx, column: str, row: str):
+    """Fire at opponent"""
+    await safe_defer(ctx)
+    
+    game = get_game(ctx.author.id)
+    if not game:
+        await ctx.send("you're not in an active battleship game. start one with `/battleship`")
+        return
+    
+    if game.game_state == "finished":
+        await ctx.send("game already finished. start a new one with `/battleship`")
+        return
+    
+    # Parse coordinates
+    try:
+        col_idx = ord(column.upper()) - 65
+        row_idx = int(row) - 1
+        
+        if not (0 <= col_idx < 10 and 0 <= row_idx < 10):
+            await ctx.send("❌ Coordinates out of bounds! Use A-J for columns, 1-10 for rows")
+            return
+    except:
+        await ctx.send("❌ Invalid format! Use: `/fire A 5`")
+        return
+    
+    # Check whose turn
+    is_player1 = ctx.author.id == game.player1_id
+    is_player2 = ctx.author.id == game.player2_id
+    
+    if not (is_player1 or is_player2):
+        await ctx.send("❌ You're not in this game!")
+        return
+    
+    # Validate turn
+    if game.is_ai:
+        if not is_player1:
+            await ctx.send("❌ This is a single-player game!")
+            return
+        if game.current_turn != 1:
+            await ctx.send("🤔 AI is calculating next move...")
+            return
+    else:
+        current_player_name = game.player1_name if game.current_turn == 1 else game.player2_name
+        if (is_player1 and game.current_turn != 1) or (is_player2 and game.current_turn != 2):
+            await ctx.send(f"⏳ It's {current_player_name}'s turn!")
+            return
+    
+    # Execute shot
+    result, ship, is_sunk, all_sunk = game.shoot(is_player1, row_idx, col_idx)
+    
+    if result == "already_shot":
+        await ctx.send(f"💧 Already shot {column.upper()}{row}! Try another spot.")
+        return
+    
+    # Build result message
+    coord_str = f"{column.upper()}{row}"
+    color = 0xFF0000 if result == "hit" else 0x0099FF
+    
+    embed = discord.Embed(color=color)
+    
+    if result == "hit":
+        embed.title = "💥 HIT!"
+        embed.description = f"Direct hit at **{coord_str}**"
+        if ship:
+            embed.add_field(name="Target", value=ship.name, inline=False)
+        if is_sunk:
+            embed.description += f"\n\n🚨 **{ship.name} SUNK!** 🚨"
+        if all_sunk:
+            embed.description += f"\n\n🏆 **YOU WIN!** 🏆\nAll enemy ships destroyed!"
+            game.game_state = "finished"
+            game.winner_id = ctx.author.id
+            embed.color = 0x00FF00
+    else:
+        embed.title = "💧 MISS"
+        embed.description = f"Shot at **{coord_str}** missed!"
+        embed.color = 0x0099FF
+    
+    await ctx.send(embed=embed)
+    
+    # AI turn (ONLY if AI game and not finished)
+    if game.is_ai and game.game_state != "finished":
+        await asyncio.sleep(0.8)
+        
+        # Get AI target
+        try:
+            ai_row, ai_col = game.ai_get_target()
+        except Exception as e:
+            print(f"[BATTLESHIP] AI targeting error: {e}")
+            await ctx.send("⚠️ AI had a moment... trying again")
+            return
+        
+        # Execute AI shot
+        try:
+            ai_result, ai_ship, ai_sunk, ai_all_sunk = game.shoot(False, ai_row, ai_col)
+        except Exception as e:
+            print(f"[BATTLESHIP] AI shoot error: {e}")
+            await ctx.send("⚠️ Something went wrong with the AI turn")
+            return
+        
+        ai_coord = f"{chr(65 + ai_col)}{ai_row + 1}"
+        
+        embed = discord.Embed(color=0xFF0000 if ai_result == "hit" else 0x0099FF)
+        embed.title = "🤖 AI COUNTERATTACK"
+        
+        if ai_result == "hit":
+            embed.title = "🤖 AI ATTACK - 💥 HIT!"
+            embed.description = f"AI fires at **{ai_coord}**...\n**DIRECT HIT!**"
+            embed.color = 0xFF0000
+            
+            if ai_ship:
+                embed.add_field(name="Your Ship Hit", value=ai_ship.name, inline=False)
+            
+            if ai_sunk:
+                embed.add_field(name="⚠️ WARNING", value=f"**{ai_ship.name} SUNK!**", inline=False)
+            
+            game.ai_last_hit = (ai_row, ai_col)
+            game.ai_in_hunt = True
+            
+            if ai_all_sunk:
+                embed.title = "☠️ GAME OVER"
+                embed.description = f"AI sank your last ship at **{ai_coord}**!\n\n🤖 **AI WINS!** ☠️"
+                embed.color = 0xFF0000
+                game.game_state = "finished"
+                game.winner_id = game.player2_id
+        else:
+            embed.title = "🤖 AI ATTACK - 💧 MISS"
+            embed.description = f"AI fires at **{ai_coord}**...\n**MISS!**"
+            embed.color = 0x0099FF
+            game.ai_in_hunt = False
+        
+        await ctx.send(embed=embed)
+        
+        # Show player their board after AI turn
+        if game.game_state != "finished":
+            await asyncio.sleep(0.5)
+            board_str = game.get_board_string(for_player1=True)
+            status_embed = game.get_game_status_embed()
+            
+            try:
+                player = await bot.fetch_user(game.player1_id)
+                await player.send(embed=status_embed)
+                await safe_send(player, f"```\n{board_str}\n```")
+            except:
+                pass
+    
+    # Switch turns for PvP
+    if game.game_state != "finished" and not game.is_ai:
+        game.current_turn = 2 if game.current_turn == 1 else 1
+        
+        # Auto-show next player their board
+        next_is_player1 = game.current_turn == 1
+        next_player_id = game.player1_id if next_is_player1 else game.player2_id
+        
+        await asyncio.sleep(0.3)
+        
+        try:
+            next_player = await bot.fetch_user(next_player_id)
+            if next_player:
+                board_str = game.get_board_string(next_is_player1)
+                status_embed = game.get_game_status_embed()
+                
+                await next_player.send(embed=status_embed)
+                await safe_send(next_player, f"```\n{board_str}\n```")
+        except Exception as e:
+            print(f"[BATTLESHIP] Failed to send board to next player: {e}")
+
+@bot.hybrid_command(name="gameboard", description="View your battleship boards")
+async def gameboard(ctx):
+    """Display current game board"""
+    await safe_defer(ctx, ephemeral=True)
+    
+    game = get_game(ctx.author.id)
+    if not game:
+        await ctx.send("you're not in an active battleship game!", ephemeral=True)
+        return
+    
+    is_player1 = ctx.author.id == game.player1_id
+    board_str = game.get_board_string(for_player1=is_player1)
+    
+    status_embed = game.get_game_status_embed()
+    ship_embed = game.get_ship_status_embed(for_player1=is_player1)
+    
+    await ctx.send(embed=status_embed, ephemeral=True)
+    await ctx.send(embed=ship_embed, ephemeral=True)
+    await safe_send(ctx, f"```\n{board_str}\n```", ephemeral=True)
+
+@bot.hybrid_command(name="quitgame", description="Forfeit battleship game")
+async def quitgame(ctx):
+    """Quit current game"""
+    await safe_defer(ctx)
+    
+    game = get_game(ctx.author.id)
+    if not game:
+        await ctx.send("you're not in a battleship game")
+        return
+    
+    is_player1 = ctx.author.id == game.player1_id
+    winner_name = game.player2_name if is_player1 else game.player1_name
+    
+    embed = discord.Embed(
+        title="⚔️ Battle Forfeited",
+        description=f"**{ctx.author.display_name}** surrendered!\n\n🏆 **{winner_name} WINS!**",
+        color=0xFFD700
+    )
+    
+    await ctx.send(embed=embed)
+    end_game(game.game_id)
+
 # ── VOICE COMMANDS ─────────────────────────────────
 @bot.hybrid_command(name="joinvc", description="Join your VC — listens, transcribes, AND speaks responses")
 async def joinvc(ctx):
@@ -1366,10 +1708,11 @@ async def joinvc(ctx):
 
 @bot.hybrid_command(name="leavevc", description="Make FG-OS leave the voice channel")
 async def leavevc(ctx):
+    await safe_defer(ctx)
     guild_id = str(ctx.guild.id)
     session  = voice_sessions.pop(guild_id, None)
     if not session:
-        await ctx.send("i'm not in a VC")
+        await safe_send(ctx, "i'm not in a VC")
         return
     try:
         if hasattr(session["vc"], "stop_listening"):
@@ -1379,7 +1722,7 @@ async def leavevc(ctx):
         await session["vc"].disconnect()
     except Exception as e:
         print(f"[VC] Leave error: {e}")
-    await ctx.send("left the VC, saved all the receipts tho")
+    await safe_send(ctx, "left the VC, saved all the receipts tho")
 
 @bot.hybrid_command(name="say", description="Make FG-OS speak something in VC")
 async def say(ctx, *, text: str):
@@ -1451,6 +1794,18 @@ async def on_message(message):
             save_memory(message.author.id, guild_id, fact)
 
     if bot.user.mentioned_in(message):
+        # Prevent duplicate handling of the same message (race between handlers)
+        if message.id in recently_handled_messages:
+            await bot.process_commands(message)
+            return
+        recently_handled_messages.add(message.id)
+        try:
+            # remove id after 10 seconds to avoid memory growth
+            loop = asyncio.get_event_loop()
+            loop.call_later(10, recently_handled_messages.discard, message.id)
+        except Exception:
+            pass
+
         async with message.channel.typing():
             try:
                 prompt = re.sub(rf"<@!?{bot.user.id}>", "", message.content or "").strip() or "yo"
@@ -1470,7 +1825,10 @@ async def on_message(message):
                     voice_client=vc
                 )
             except Exception as e:
-                await message.reply(f"⚠️ Error: {e}")
+                try:
+                    await safe_send(message, f"⚠️ Error: {e}")
+                except Exception:
+                    pass
 
     await bot.process_commands(message)
 

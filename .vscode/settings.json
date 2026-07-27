@@ -1,0 +1,8 @@
+{
+    "chat.tools.terminal.autoApprove": {
+        "/^Set-Location \"c:/Users/arnav/Documents/Coding/Discord Bots/FG-OS Bot\"; python -c \"import os; print\\(os\\.getcwd\\(\\)\\)\"$/": {
+            "approve": true,
+            "matchCommandLine": true
+        }
+    }
+}
