@@ -37,6 +37,49 @@ def setup_database():
         )
         """
     )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS birthday_profiles (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id TEXT NOT NULL,
+            guild_id TEXT NOT NULL,
+            birthday TEXT NOT NULL,
+            timezone TEXT NOT NULL DEFAULT 'UTC',
+            announcement_enabled INTEGER NOT NULL DEFAULT 1,
+            interview_completed INTEGER NOT NULL DEFAULT 0,
+            last_celebrated_year INTEGER,
+            last_birthday_reply_date TEXT,
+            favorite_color TEXT,
+            favorite_food TEXT,
+            favorite_game TEXT,
+            favorite_artist TEXT,
+            favorite_movie TEXT,
+            favorite_hobby TEXT,
+            favorite_cake TEXT,
+            fun_fact TEXT,
+            birthday_wish TEXT,
+            nickname TEXT,
+            role_removal_at TEXT,
+            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(user_id, guild_id)
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS birthday_interviews (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id TEXT NOT NULL,
+            guild_id TEXT NOT NULL,
+            current_step INTEGER NOT NULL DEFAULT 0,
+            answers_json TEXT NOT NULL DEFAULT '{}',
+            status TEXT NOT NULL DEFAULT 'pending',
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(user_id, guild_id)
+        )
+        """
+    )
     conn.commit()
     conn.close()
     return DB_NAME

@@ -28,6 +28,15 @@ from collections import Counter, defaultdict
 from dotenv import load_dotenv
 from battleship import create_game, get_game, get_game_by_id, end_game
 from core.ai import ask_ai
+from core.birthday import (
+    get_all_birthday_profiles,
+    get_birthday_profile,
+    get_interview_progress,
+    has_birthday_day_reply,
+    note_birthday_day_reply,
+)
+from core.birthday_commands import birthday_group
+from core.birthday_tasks import birthday_clock, handle_birthday_dm_answer
 
 app = FastAPI()
 
@@ -1026,12 +1035,17 @@ async def conversation_starter():
         except Exception as e:
             print(f"Starter error: {e}")
 
+@tasks.loop(hours=1)
+async def check_birthdays():
+    await birthday_clock(bot)
+
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # BOT LIFECYCLE
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 @bot.event
 async def setup_hook():
+    bot.tree.add_command(birthday_group)
     await bot.tree.sync()
     print("Slash commands synced!")
 
@@ -1041,6 +1055,9 @@ async def on_ready():
         check_reminders.start()
     if not conversation_starter.is_running():
         conversation_starter.start()
+    if not check_birthdays.is_running():
+        check_birthdays.start()
+    await birthday_clock(bot)
     print("=" * 50)
     print(f"FG-OS LIVE: {bot.user.name}")
     print(f"Backend: Groq | TTS: edge-tts | Whisper: {WHISPER_MODEL}")
@@ -1788,10 +1805,29 @@ async def on_message(message):
     content  = (message.content or "").strip()
     guild_id = str(message.guild.id) if message.guild else "dm"
 
+    if message.guild is None:
+        birthday_profiles = [p for p in get_all_birthday_profiles() if str(p.user_id) == str(message.author.id)]
+        for profile in birthday_profiles:
+            progress = get_interview_progress(str(profile.user_id), str(profile.guild_id))
+            await handle_birthday_dm_answer(message, profile, progress)
+        await bot.process_commands(message)
+        return
+
     if content and not content.startswith("/") and not content.startswith("!"):
         log_message(message.author.id, guild_id, message.author.display_name, content)
         for fact in extract_facts(content):
             save_memory(message.author.id, guild_id, fact)
+
+        profile = get_birthday_profile(str(message.author.id), guild_id)
+        if profile and profile.birthday and profile.timezone:
+            try:
+                birthday_now = datetime.datetime.now(datetime.timezone.utc).astimezone(__import__("zoneinfo").ZoneInfo(profile.timezone or "UTC"))
+                birthday = datetime.date.fromisoformat(profile.birthday)
+                if birthday.month == birthday_now.month and birthday.day == birthday_now.day and not has_birthday_day_reply(str(message.author.id), guild_id):
+                    note_birthday_day_reply(str(message.author.id), guild_id)
+                    await message.reply(f"🎂 A very happy birthday to you, {message.author.display_name} — I’m glad you’re here with us.")
+            except Exception:
+                pass
 
     if bot.user.mentioned_in(message):
         # Prevent duplicate handling of the same message (race between handlers)
