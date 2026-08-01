@@ -637,7 +637,10 @@ def call_ai(system: str, history: list, user_msg: str, max_tokens: int = 800) ->
 
 def quick_ai(prompt: str, max_tokens: int = 500) -> str:
     system = "You are FG-OS. Be concise, accurate, and natural. Answer directly without corporate hedging."
-    return call_ai(system, [], prompt, max_tokens)
+    try:
+        return call_ai(system, [], prompt, max_tokens)
+    except Exception:
+        return "AI is currently unavailable."
 
 def transcribe_audio(audio_bytes: bytes, filename: str = "audio.wav") -> str:
     """Transcribe audio bytes with validation and error handling."""
@@ -1215,6 +1218,7 @@ async def leaderboard(ctx):
     await ctx.send(embed=embed)
 
 @bot.hybrid_command(name="servervibe", description="AI reads the server's current mood")
+@commands.cooldown(1, 60, commands.BucketType.guild)
 async def servervibe(ctx):
     await ctx.defer()
     guild_id    = str(ctx.guild.id) if ctx.guild else "dm"
@@ -1222,8 +1226,20 @@ async def servervibe(ctx):
     if len(server_msgs) < 5:
         await ctx.send("not enough messages logged yet")
         return
-    sample = "\n".join(f"{u}: {m}" for u, m in server_msgs[-30:])
-    prompt = f"Analyze the vibe of this Discord server in 3-4 casual sentences. Energy, topics, mood.\n\n{sample}"
+    sample = "\n".join(
+        f"{u}: {m[:200]}"
+        for u, m in server_msgs[-30:]
+    )
+    prompt = (
+        "Analyze this Discord server's current vibe. Mention:\n"
+        "- overall mood\n"
+        "- main topics\n"
+        "- funniest patterns\n"
+        "- community energy\n\n"
+        "Keep it casual and friendly. Do not mention usernames unless important.\n"
+        "Write 3-5 sentences.\n\n"
+        f"{sample}"
+    )
     try:
         vibe  = quick_ai(prompt, max_tokens=180)
         embed = discord.Embed(title="🌡️ Server Vibe Check", description=vibe, color=0x57F287)

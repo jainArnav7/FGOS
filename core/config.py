@@ -1,7 +1,7 @@
 import os
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-MODEL = "moonshotai/kimi-k2-instruct"
+MODEL = "llama-3.3-70b-versatile"
 
 BIRTHDAY_CHANNEL_ID = int(os.getenv("BIRTHDAY_CHANNEL_ID", "0") or 0)
 BIRTHDAY_ROLE_ID = int(os.getenv("BIRTHDAY_ROLE_ID", "0") or 0)

@@ -45,12 +45,20 @@ def ask_ai(user, system_prompt=None, history=None, max_tokens=800):
 
     messages.append({"role": "user", "content": prompt})
 
-    completion = client.chat.completions.create(
-        model=MODEL,
-        messages=messages,
-        max_tokens=max_tokens,
-        temperature=0.7,
-    )
+    try:
+        completion = client.chat.completions.create(
+            model=MODEL,
+            messages=messages,
+            max_tokens=max_tokens,
+            temperature=0.7,
+        )
+    except Exception:
+        completion = client.chat.completions.create(
+            model="llama-3.1-8b-instant",
+            messages=messages,
+            max_tokens=max_tokens,
+            temperature=0.7,
+        )
 
     reply = completion.choices[0].message.content or ""
     reply = _clean_reply(reply)
